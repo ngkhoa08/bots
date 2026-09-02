@@ -1,17 +1,18 @@
 from __future__ import annotations
 
+import base64
 import hmac
 import json
 import os
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request, Response
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
-from browser_bridge import messenger
+from browser_bridge import MESSENGER_URL, RUNTIME_STATE, messenger
 
-app = FastAPI(title="Personal Messenger MCP Bridge - Render", version="0.2.0")
+app = FastAPI(title="Personal Messenger MCP Bridge - Render", version="0.3.0")
 
 ALLOWED_ORIGINS = {
     x.strip() for x in os.getenv(
@@ -26,9 +27,15 @@ ACCESS_KEY = os.getenv("MCP_ACCESS_KEY", "").strip()
 @app.middleware("http")
 async def origin_guard(request: Request, call_next):
     origin = request.headers.get("origin")
-    if origin and origin not in ALLOWED_ORIGINS:
+    host = request.headers.get("host", "")
+    same_origin = bool(origin and origin.rstrip("/") == f"{request.url.scheme}://{host}".rstrip("/"))
+    if origin and origin not in ALLOWED_ORIGINS and not same_origin:
         return JSONResponse({"detail": f"Origin not allowed: {origin}"}, status_code=403)
-    return await call_next(request)
+    response = await call_next(request)
+    if request.url.path.startswith("/setup/"):
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+    return response
 
 
 @app.on_event("shutdown")
@@ -139,6 +146,7 @@ async def root() -> dict[str, Any]:
         "name": "Personal Messenger MCP Bridge - Render",
         "health": "/health",
         "mcp": "/mcp/<MCP_ACCESS_KEY>",
+        "setup": "/setup/<MCP_ACCESS_KEY>",
         "browser": "lazy-start + idle auto-close",
         "warning": "Unofficial Messenger Web automation. Never expose your session secret or access key.",
     }
@@ -178,6 +186,149 @@ async def api_send(request: Request, body: SendBody) -> Any:
     return await messenger.send_message(body.chat, body.message)
 
 
+SETUP_HTML = r'''<!doctype html>
+<html lang="vi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Messenger Login - Render</title>
+<style>
+body{font-family:system-ui,-apple-system,sans-serif;background:#111;color:#eee;margin:0;padding:16px}main{max-width:1060px;margin:auto}.card{background:#1d1d1d;border:1px solid #333;border-radius:14px;padding:14px;margin-bottom:12px}h2{margin:0 0 8px}.warn{color:#ffca76}.ok{color:#78df9a}#screen{width:100%;height:auto;display:block;background:#fff;border-radius:10px;cursor:crosshair;touch-action:manipulation}.row{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}input{flex:1;min-width:220px;padding:12px;border-radius:9px;border:1px solid #555;background:#111;color:#fff;font-size:16px}button{padding:11px 14px;border:0;border-radius:9px;cursor:pointer;font-weight:600}#msg{white-space:pre-wrap;font-size:14px}small{color:#aaa}code{word-break:break-all}</style></head>
+<body><main><div class="card"><h2>Đăng nhập Messenger trên browser của Render</h2>
+<div class="warn">Đây là bộ điều khiển Chromium trên chính Render của bạn, không phải form đăng nhập Facebook tự tạo.</div>
+<small>Click vào ảnh để click trong browser từ xa. Sau đó nhập chữ vào ô bên dưới và bấm “Gõ”. Mật khẩu đi qua service Render của chính bạn và ứng dụng không ghi request body vào log.</small>
+<div id="msg">Đang khởi động...</div></div>
+<div class="card"><img id="screen" alt="Remote browser screenshot"></div>
+<div class="card"><div class="row"><input id="txt" autocomplete="off" placeholder="Nội dung cần gõ vào ô đang chọn"><button onclick="typeText()">Gõ</button><button onclick="keyPress('Tab')">Tab</button><button onclick="keyPress('Enter')">Enter</button><button onclick="keyPress('Backspace')">⌫</button></div>
+<div class="row"><button onclick="saveSession()">✅ Lưu phiên đăng nhập</button><button onclick="restartLogin()">Mở lại Messenger</button><button onclick="clearSession()">Xóa phiên & đăng nhập lại</button></div></div>
+</main><script>
+const base=location.pathname.replace(/\/$/,''); const img=document.getElementById('screen'), msg=document.getElementById('msg'), txt=document.getElementById('txt');
+async function post(s,data={}){const r=await fetch(base+s,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(data)});const j=await r.json().catch(()=>({error:'HTTP '+r.status}));if(!r.ok)throw new Error(j.detail||j.error||('HTTP '+r.status));return j}
+async function snap(){try{const j=await post('/snapshot');img.src=j.image;msg.innerHTML=(j.logged_in?'<span class="ok">● Đã đăng nhập</span>':'<span class="warn">● Chưa xác nhận đăng nhập</span>')+' — '+j.url}catch(e){msg.textContent=e.message}}
+async function start(){try{await post('/start');await snap()}catch(e){msg.textContent=e.message}}
+img.addEventListener('click',async e=>{const r=img.getBoundingClientRect();const x=(e.clientX-r.left)*1024/r.width;const y=(e.clientY-r.top)*720/r.height;try{await post('/click',{x,y});setTimeout(snap,350)}catch(er){msg.textContent=er.message}});
+async function typeText(){if(!txt.value)return;const v=txt.value;txt.value='';try{await post('/type',{text:v});setTimeout(snap,350)}catch(e){msg.textContent=e.message}}
+async function keyPress(key){try{await post('/key',{key});setTimeout(snap,300)}catch(e){msg.textContent=e.message}}
+async function saveSession(){try{const j=await post('/save');msg.innerHTML='<span class="ok">Đã lưu phiên. '+(j.logged_in?'Messenger đang đăng nhập.':'')+'</span>';await snap()}catch(e){msg.textContent=e.message}}
+async function restartLogin(){try{await post('/start');await snap()}catch(e){msg.textContent=e.message}}
+async function clearSession(){if(!confirm('Xóa session hiện tại và đăng nhập lại?'))return;try{await post('/clear');await start()}catch(e){msg.textContent=e.message}}
+txt.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();typeText()}}); start(); setInterval(snap,1800);
+</script></body></html>'''
+
+
+class SetupClick(BaseModel):
+    x: float
+    y: float
+
+
+class SetupType(BaseModel):
+    text: str = Field(min_length=1, max_length=2000)
+
+
+class SetupKey(BaseModel):
+    key: str
+
+
+async def _setup_page() -> Any:
+    page = await messenger._get_page_unlocked()
+    if page.url == "about:blank":
+        await page.goto(MESSENGER_URL, wait_until="domcontentloaded", timeout=35_000)
+        await page.wait_for_timeout(900)
+    messenger._touch_unlocked()
+    return page
+
+
+@app.get("/setup/{key}", response_class=HTMLResponse)
+async def setup_ui(request: Request, key: str) -> HTMLResponse:
+    _require_auth(request, key)
+    return HTMLResponse(SETUP_HTML)
+
+
+@app.post("/setup/{key}/start")
+async def setup_start(request: Request, key: str) -> Any:
+    _require_auth(request, key)
+    async with messenger._lock:
+        page = await messenger._get_page_unlocked()
+        await page.goto(MESSENGER_URL, wait_until="domcontentloaded", timeout=35_000)
+        await page.wait_for_timeout(900)
+        messenger._touch_unlocked()
+        return {"ok": True, "url": page.url}
+
+
+@app.post("/setup/{key}/snapshot")
+async def setup_snapshot(request: Request, key: str) -> Any:
+    _require_auth(request, key)
+    async with messenger._lock:
+        page = await _setup_page()
+        shot = await page.screenshot(type="jpeg", quality=55)
+        logged_in = await messenger._is_logged_in(page)
+        return {
+            "image": "data:image/jpeg;base64," + base64.b64encode(shot).decode("ascii"),
+            "url": page.url,
+            "logged_in": logged_in,
+        }
+
+
+@app.post("/setup/{key}/click")
+async def setup_click(request: Request, key: str, body: SetupClick) -> Any:
+    _require_auth(request, key)
+    x = max(0.0, min(float(body.x), 1024.0))
+    y = max(0.0, min(float(body.y), 720.0))
+    async with messenger._lock:
+        page = await _setup_page()
+        await page.mouse.click(x, y)
+        await page.wait_for_timeout(250)
+        messenger._touch_unlocked()
+        return {"ok": True, "url": page.url}
+
+
+@app.post("/setup/{key}/type")
+async def setup_type(request: Request, key: str, body: SetupType) -> Any:
+    _require_auth(request, key)
+    async with messenger._lock:
+        page = await _setup_page()
+        await page.keyboard.type(body.text, delay=18)
+        await page.wait_for_timeout(150)
+        messenger._touch_unlocked()
+        return {"ok": True}
+
+
+@app.post("/setup/{key}/key")
+async def setup_key(request: Request, key: str, body: SetupKey) -> Any:
+    _require_auth(request, key)
+    allowed = {"Enter", "Tab", "Backspace", "Escape", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Space"}
+    if body.key not in allowed:
+        raise HTTPException(400, "Unsupported key")
+    async with messenger._lock:
+        page = await _setup_page()
+        await page.keyboard.press(body.key)
+        await page.wait_for_timeout(150)
+        messenger._touch_unlocked()
+        return {"ok": True}
+
+
+@app.post("/setup/{key}/save")
+async def setup_save(request: Request, key: str) -> Any:
+    _require_auth(request, key)
+    async with messenger._lock:
+        page = await _setup_page()
+        logged_in = await messenger._is_logged_in(page)
+        if not logged_in:
+            raise HTTPException(400, "Messenger chưa xác nhận đăng nhập. Hoàn tất đăng nhập trước rồi bấm Lưu phiên.")
+        await messenger._persist_runtime_state_unlocked()
+        messenger._touch_unlocked()
+        return {"saved": True, "logged_in": True, "runtime_state": str(RUNTIME_STATE)}
+
+
+@app.post("/setup/{key}/clear")
+async def setup_clear(request: Request, key: str) -> Any:
+    _require_auth(request, key)
+    async with messenger._lock:
+        await messenger._close_unlocked()
+        try:
+            RUNTIME_STATE.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return {"cleared": True}
+
+
 async def _handle_mcp(request: Request, key: str | None = None) -> Response:
     _require_auth(request, key)
     try:
@@ -207,7 +358,7 @@ async def _handle_mcp(request: Request, key: str | None = None) -> Response:
                 "serverInfo": {
                     "name": "personal-messenger-render-bridge",
                     "title": "Personal Messenger Render Bridge",
-                    "version": "0.2.0",
+                    "version": "0.3.0",
                 },
                 "instructions": (
                     "This server reads the account owner's Messenger Web session. "
