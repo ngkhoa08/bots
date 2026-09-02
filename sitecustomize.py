@@ -40,67 +40,69 @@ if os.getenv("PORT"):
         import browser_bridge as _bb
 
         async def _maybe_submit_message_pin(page):
+            """Use in-page JavaScript (console-style), not Playwright typing/clicking."""
             pin = os.getenv("FACEBOOK_MESSAGE_PIN", "").strip()
             if not pin:
                 return False
             try:
-                state = await page.evaluate(
-                    """() => {
-                      const t = ((document.body && document.body.innerText) || '').toLowerCase();
-                      return {
-                        pinPrompt: ['enter your pin','enter pin','nhập mã pin','nhập pin','restore chat history','restore your chats','khôi phục lịch sử','mã pin để khôi phục'].some(x => t.includes(x)),
-                        login: t.includes('log into facebook') || t.includes('đăng nhập facebook')
+                result = await page.evaluate(
+                    """(pin) => {
+                      const body = ((document.body && document.body.innerText) || '').toLowerCase();
+                      const prompt = ['enter your pin','enter pin','nhập mã pin','nhập pin','restore chat history','restore your chats','khôi phục lịch sử','mã pin để khôi phục'].some(x => body.includes(x));
+                      const login = body.includes('log into facebook') || body.includes('đăng nhập facebook');
+                      if (!prompt || login) return {ok:false, reason:'no_pin_prompt'};
+
+                      const visible = el => {
+                        const r = el.getBoundingClientRect();
+                        const s = getComputedStyle(el);
+                        return r.width > 1 && r.height > 1 && s.display !== 'none' && s.visibility !== 'hidden';
                       };
-                    }"""
+                      const selectors = [
+                        'input[autocomplete="one-time-code"]',
+                        'input[inputmode="numeric"]',
+                        'input[aria-label*="PIN" i]',
+                        'input[placeholder*="PIN" i]',
+                        'input[type="password"]'
+                      ];
+                      let input = null;
+                      for (const sel of selectors) {
+                        input = Array.from(document.querySelectorAll(sel)).find(visible) || null;
+                        if (input) break;
+                      }
+                      if (!input) return {ok:false, reason:'pin_input_not_found'};
+
+                      input.focus();
+                      const proto = Object.getPrototypeOf(input);
+                      const desc = Object.getOwnPropertyDescriptor(proto, 'value') || Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+                      if (desc && desc.set) desc.set.call(input, pin); else input.value = pin;
+                      input.dispatchEvent(new InputEvent('input', {bubbles:true, inputType:'insertText', data:pin}));
+                      input.dispatchEvent(new Event('change', {bubbles:true}));
+
+                      const labels = ['continue','tiếp tục','confirm','xác nhận','restore','khôi phục','done','xong'];
+                      const buttons = Array.from(document.querySelectorAll('button,[role="button"]')).filter(visible);
+                      const button = buttons.find(b => {
+                        const t = ((b.getAttribute('aria-label') || '') + ' ' + (b.innerText || b.textContent || '')).trim().toLowerCase();
+                        return labels.some(x => t.includes(x));
+                      });
+                      if (button) {
+                        button.click();
+                        return {ok:true, method:'dom_button_click'};
+                      }
+
+                      for (const type of ['keydown','keypress','keyup']) {
+                        input.dispatchEvent(new KeyboardEvent(type, {key:'Enter', code:'Enter', keyCode:13, which:13, bubbles:true, cancelable:true}));
+                      }
+                      return {ok:true, method:'dom_enter_events'};
+                    }""",
+                    pin,
                 )
             except Exception:
                 return False
-            if not state.get("pinPrompt") or state.get("login"):
-                return False
-
-            target = None
-            for selector in (
-                'input[autocomplete="one-time-code"]',
-                'input[inputmode="numeric"]',
-                'input[aria-label*="PIN" i]',
-                'input[placeholder*="PIN" i]',
-                'input[type="password"]',
-            ):
-                try:
-                    loc = page.locator(selector)
-                    count = min(await loc.count(), 6)
-                    for i in range(count):
-                        candidate = loc.nth(i)
-                        if await candidate.is_visible():
-                            target = candidate
-                            break
-                except Exception:
-                    continue
-                if target is not None:
-                    break
-            if target is None:
-                return False
-            try:
-                await target.fill(pin)
-            except Exception:
-                return False
-            for label in ("Continue", "Tiếp tục", "Confirm", "Xác nhận", "Restore", "Khôi phục", "Done", "Xong"):
-                try:
-                    b = page.get_by_role("button", name=label, exact=False)
-                    if await b.count() and await b.first.is_visible():
-                        await b.first.click()
-                        await page.wait_for_timeout(1400)
-                        print("[pin] secure-storage PIN submitted", flush=True)
-                        return True
-                except Exception:
-                    continue
-            try:
-                await target.press("Enter")
+            if result.get("ok"):
                 await page.wait_for_timeout(1400)
-                print("[pin] secure-storage PIN submitted with Enter", flush=True)
+                print(f"[pin] secure-storage PIN submitted via console DOM ({result.get('method')})", flush=True)
                 return True
-            except Exception:
-                return False
+            return False
 
         async def _waited_list_chats(self, limit: int = 20):
             limit = max(1, min(int(limit), 100))
@@ -114,7 +116,7 @@ if os.getenv("PORT"):
                         raw = await page.evaluate(
                             """() => {
                               const root = document.querySelector('[role="navigation"][aria-label="Thread list"]') || document;
-                              const clean = s => (s || '').replace(/\\s+/g, ' ').trim();
+                              const clean = s => (s || '').replace(/\s+/g, ' ').trim();
                               const rows = [];
                               const seen = new Set();
                               for (const a of root.querySelectorAll('a[href]')) {
@@ -157,14 +159,14 @@ if os.getenv("PORT"):
             try:
                 return await page.evaluate(
                     """(limit) => {
-                      const clean = s => (s || '').replace(/[ \\t]+/g, ' ').replace(/\\n{3,}/g, '\\n\\n').trim();
+                      const clean = s => (s || '').replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
                       const visible = el => {
                         const r = el.getBoundingClientRect();
                         const st = getComputedStyle(el);
                         return r.width > 1 && r.height > 1 && st.display !== 'none' && st.visibility !== 'hidden';
                       };
                       const main = document.querySelector('[role="main"]') || document.body;
-                      const composers = Array.from(document.querySelectorAll('[role="textbox"][contenteditable="true"], div[contenteditable="true"]')).filter(visible);
+                      const composers = Array.from(document.querySelectorAll('[role="textbox"][contenteditable="true"], div[contenteditable="true"], textarea')).filter(visible);
                       const candidates = Array.from(main.querySelectorAll('[role="row"], [data-scope="messages_table"] [role="row"], div[dir="auto"]')).filter(visible);
                       const texts = [];
                       const seen = new Set();
@@ -200,6 +202,67 @@ if os.getenv("PORT"):
                 await page.wait_for_timeout(900)
             return last
 
+        async def _console_set_text_and_send(page, message: str):
+            """Manipulate Messenger from page JS, like DevTools console, without mouse/keyboard APIs."""
+            return await page.evaluate(
+                """(message) => {
+                  const visible = el => {
+                    const r = el.getBoundingClientRect();
+                    const s = getComputedStyle(el);
+                    return r.width > 1 && r.height > 1 && s.display !== 'none' && s.visibility !== 'hidden';
+                  };
+                  const clean = s => (s || '').replace(/\s+/g, ' ').trim();
+                  const editors = Array.from(document.querySelectorAll('[role="textbox"][contenteditable="true"],div[contenteditable="true"],textarea')).filter(visible);
+                  if (!editors.length) return {ok:false, reason:'composer_not_found'};
+                  const editor = editors[editors.length - 1];
+                  editor.focus();
+
+                  let inserted = false;
+                  if (editor instanceof HTMLInputElement || editor instanceof HTMLTextAreaElement) {
+                    const proto = editor instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+                    const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+                    if (desc && desc.set) desc.set.call(editor, message); else editor.value = message;
+                    editor.dispatchEvent(new InputEvent('input', {bubbles:true, inputType:'insertText', data:message}));
+                    editor.dispatchEvent(new Event('change', {bubbles:true}));
+                    inserted = true;
+                  } else {
+                    try {
+                      const sel = window.getSelection();
+                      const range = document.createRange();
+                      range.selectNodeContents(editor);
+                      sel.removeAllRanges();
+                      sel.addRange(range);
+                      inserted = document.execCommand('insertText', false, message);
+                    } catch (_) {}
+                    if (!inserted) {
+                      editor.textContent = message;
+                      editor.dispatchEvent(new InputEvent('input', {bubbles:true, inputType:'insertText', data:message}));
+                      inserted = true;
+                    }
+                  }
+
+                  const labels = ['send','gửi'];
+                  const buttons = Array.from(document.querySelectorAll('button,[role="button"]')).filter(visible);
+                  const sendButton = buttons.find(b => {
+                    const t = clean((b.getAttribute('aria-label') || '') + ' ' + (b.getAttribute('title') || '') + ' ' + (b.innerText || b.textContent || '')).toLowerCase();
+                    return labels.some(x => t === x || t.startsWith(x + ' ') || t.includes(' ' + x + ' '));
+                  });
+                  if (sendButton) {
+                    sendButton.click();
+                    return {ok:true, inserted, submit_method:'dom_button_click'};
+                  }
+
+                  for (const type of ['keydown','keypress','keyup']) {
+                    editor.dispatchEvent(new KeyboardEvent(type, {
+                      key:'Enter', code:'Enter', keyCode:13, which:13,
+                      bubbles:true, cancelable:true, composed:true
+                    }));
+                  }
+                  return {ok:true, inserted, submit_method:'dom_enter_events'};
+                }""",
+                message,
+            )
+
         async def _read_chat_light(self, chat: str, limit: int = 30):
             limit = max(1, min(int(limit), 100))
             url, resolved_name = await self._resolve_chat(chat)
@@ -216,6 +279,7 @@ if os.getenv("PORT"):
                     "url": page.url,
                     "messages": cleaned[-limit:],
                     "site": "Facebook Web Messages",
+                    "browser_method": "in_page_javascript_console",
                     "composer_present": int(snap.get("composerCount", 0)) > 0,
                     "composer_count": int(snap.get("composerCount", 0)),
                     "ui_message_nodes": int(snap.get("nodeCount", 0)),
@@ -237,26 +301,43 @@ if os.getenv("PORT"):
                 snap = await _wait_conversation_ready(page, 5)
                 if int(snap.get("composerCount", 0)) <= 0:
                     raise RuntimeError("Không tìm thấy ô soạn tin sau khi đã chờ Facebook tải hội thoại.")
-                composer = page.locator('[role="textbox"][contenteditable="true"]')
-                if await composer.count() == 0:
-                    composer = page.locator('div[contenteditable="true"]')
-                if await composer.count() == 0:
-                    raise RuntimeError("Không tìm thấy ô soạn tin trên Facebook Web.")
-                box = composer.last
-                await box.click()
-                try:
-                    await box.fill(message)
-                except Exception:
-                    await page.keyboard.type(message, delay=10)
-                await box.press("Enter")
-                await page.wait_for_timeout(900)
+
+                action = await _console_set_text_and_send(page, message)
+                if not action.get("ok"):
+                    raise RuntimeError(f"Console DOM action failed: {action.get('reason')}")
+                await page.wait_for_timeout(1100)
+
+                verify = await page.evaluate(
+                    """() => {
+                      const visible = el => {
+                        const r = el.getBoundingClientRect();
+                        const s = getComputedStyle(el);
+                        return r.width > 1 && r.height > 1 && s.display !== 'none' && s.visibility !== 'hidden';
+                      };
+                      const editors = Array.from(document.querySelectorAll('[role="textbox"][contenteditable="true"],div[contenteditable="true"],textarea')).filter(visible);
+                      if (!editors.length) return {composer:false, empty:true};
+                      const e = editors[editors.length - 1];
+                      const t = (('value' in e ? e.value : e.innerText || e.textContent || '') || '').trim();
+                      return {composer:true, empty:t.length === 0, remaining:t.slice(0,120)};
+                    }"""
+                )
                 self._touch_unlocked()
-                return {"sent": True, "chat": resolved_name, "text": message, "url": page.url, "site": "Facebook Web Messages"}
+                sent = bool(verify.get("empty"))
+                return {
+                    "sent": sent,
+                    "chat": resolved_name,
+                    "text": message,
+                    "url": page.url,
+                    "site": "Facebook Web Messages",
+                    "browser_method": "in_page_javascript_console",
+                    "submit_method": action.get("submit_method"),
+                    "verification": "composer_cleared" if sent else "composer_not_cleared",
+                }
 
         _bb.MessengerBrowser.list_chats = _waited_list_chats
         _bb.MessengerBrowser.read_chat = _read_chat_light
         _bb.MessengerBrowser.send_message = _send_message_light
-        print("[runtime-patch] lightweight list/read/send extractors installed", flush=True)
+        print("[runtime-patch] console DOM list/read/send extractors installed", flush=True)
     except Exception as exc:
         print(f"[runtime-patch] failed: {type(exc).__name__}: {exc}", flush=True)
 
@@ -291,6 +372,7 @@ def _run_selfdiag() -> None:
                 "composer_count": probe.get("composer_count"),
                 "ui_message_nodes": probe.get("ui_message_nodes"),
                 "send_dry_run": probe.get("send_dry_run"),
+                "browser_method": probe.get("browser_method"),
                 "ui_probe": probe.get("ui_probe"),
                 "error": probe.get("error"),
             }, ensure_ascii=False)[:12000], flush=True)
