@@ -8,9 +8,10 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 
 from browser_bridge import messenger
+from cookie_import import register_cookie_import
 from live_setup import register_live_setup
 
-app = FastAPI(title="Personal Messenger MCP Bridge", version="0.4.0")
+app = FastAPI(title="Personal Messenger MCP Bridge", version="0.5.0")
 ACCESS_KEY = os.environ.get("MCP_ACCESS_KEY", "").strip()
 SUPPORTED_PROTOCOLS = {"2025-06-18", "2025-03-26"}
 
@@ -77,7 +78,13 @@ async def _call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
 
 @app.get("/")
 async def root() -> dict[str, str]:
-    return {"status": "ok", "health": "/health", "live_login": "/live/<key>", "mcp": "/mcp/<key>"}
+    return {
+        "status": "ok",
+        "health": "/health",
+        "cookie_login": "/cookie/<key>",
+        "live_login": "/live/<key>",
+        "mcp": "/mcp/<key>",
+    }
 
 
 @app.get("/health")
@@ -112,7 +119,12 @@ async def mcp_post(key: str, request: Request) -> Response:
     if method == "initialize":
         requested = (body.get("params") or {}).get("protocolVersion", "2025-06-18")
         protocol = requested if requested in SUPPORTED_PROTOCOLS else "2025-06-18"
-        result = {"protocolVersion": protocol, "capabilities": {"tools": {"listChanged": False}}, "serverInfo": {"name": "personal-messenger-render-bridge", "version": "0.4.0"}, "instructions": "Read the account owner's Messenger Web session. Send messages only when explicitly requested. Never reveal session data or access keys."}
+        result = {
+            "protocolVersion": protocol,
+            "capabilities": {"tools": {"listChanged": False}},
+            "serverInfo": {"name": "personal-messenger-render-bridge", "version": "0.5.0"},
+            "instructions": "Read the account owner's Messenger Web session. Send messages only when explicitly requested. Never reveal session data or access keys.",
+        }
     elif method == "ping":
         result = {}
     elif method == "tools/list":
@@ -129,4 +141,5 @@ async def mcp_post(key: str, request: Request) -> Response:
     return JSONResponse({"jsonrpc": "2.0", "id": req_id, "result": result})
 
 
+register_cookie_import(app, ACCESS_KEY)
 register_live_setup(app, ACCESS_KEY)
