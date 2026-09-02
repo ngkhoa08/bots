@@ -12,12 +12,51 @@ from urllib.parse import urljoin, urlparse
 
 from playwright.async_api import Browser, BrowserContext, Page, Playwright, Route, async_playwright
 
-ROOT = Path(__file__).resolve().parent
 RUNTIME_STATE = Path(os.getenv("RUNTIME_STATE_PATH", "/tmp/messenger_runtime_state.json"))
 MESSENGER_URL = os.getenv("MESSENGER_URL", "https://www.messenger.com/")
 HEADLESS = os.getenv("HEADLESS", "true").lower() not in {"0", "false", "no"}
 BLOCK_HEAVY = os.getenv("BLOCK_HEAVY_RESOURCES", "true").lower() not in {"0", "false", "no"}
 IDLE_SECONDS = max(20, int(os.getenv("BROWSER_IDLE_SECONDS", "90")))
+
+
+def _sanitize_storage_state(raw: Any) -> dict[str, Any] | None:
+    """Keep only Playwright cookies + localStorage.
+
+    Older builds saved IndexedDB as part of storage_state. Some Messenger
+    IndexedDB entries contain keys that Playwright cannot restore reliably,
+    causing: "Unable to restore IndexedDB ... value that is not a valid key".
+    We deliberately drop IndexedDB here; Messenger authentication works from
+    cookies, while localStorage is retained when present.
+    """
+    if not isinstance(raw, dict):
+        return None
+
+    cookies = raw.get("cookies")
+    if not isinstance(cookies, list):
+        cookies = []
+
+    clean_origins: list[dict[str, Any]] = []
+    origins = raw.get("origins")
+    if isinstance(origins, list):
+        for item in origins:
+            if not isinstance(item, dict):
+                continue
+            origin = item.get("origin")
+            if not isinstance(origin, str) or not origin:
+                continue
+            local_out: list[dict[str, str]] = []
+            local = item.get("localStorage")
+            if isinstance(local, list):
+                for entry in local:
+                    if not isinstance(entry, dict):
+                        continue
+                    name = entry.get("name")
+                    value = entry.get("value")
+                    if isinstance(name, str) and isinstance(value, str):
+                        local_out.append({"name": name, "value": value})
+            clean_origins.append({"origin": origin, "localStorage": local_out})
+
+    return {"cookies": cookies, "origins": clean_origins}
 
 
 class MessengerBrowser:
@@ -33,16 +72,25 @@ class MessengerBrowser:
     def _initial_state(self) -> dict[str, Any] | None:
         if RUNTIME_STATE.exists():
             try:
-                return json.loads(RUNTIME_STATE.read_text(encoding="utf-8"))
+                raw = json.loads(RUNTIME_STATE.read_text(encoding="utf-8"))
+                clean = _sanitize_storage_state(raw)
+                if clean is not None:
+                    # Heal state files created by the old IndexedDB-enabled build.
+                    RUNTIME_STATE.write_text(json.dumps(clean, ensure_ascii=False), encoding="utf-8")
+                    return clean
             except Exception:
-                pass
+                try:
+                    RUNTIME_STATE.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
-        raw = os.getenv("MESSENGER_STORAGE_STATE_B64", "").strip()
-        if not raw:
+        encoded = os.getenv("MESSENGER_STORAGE_STATE_B64", "").strip()
+        if not encoded:
             return None
         try:
-            decoded = base64.b64decode(raw, validate=True)
-            return json.loads(decoded.decode("utf-8"))
+            decoded = base64.b64decode(encoded, validate=True)
+            raw = json.loads(decoded.decode("utf-8"))
+            return _sanitize_storage_state(raw)
         except Exception as exc:
             raise RuntimeError("MESSENGER_STORAGE_STATE_B64 không hợp lệ") from exc
 
@@ -84,14 +132,28 @@ class MessengerBrowser:
             ],
         )
 
-        state = self._initial_state()
         kwargs: dict[str, Any] = {
             "viewport": {"width": 1024, "height": 720},
             "locale": "vi-VN",
         }
+        state = self._initial_state()
         if state:
             kwargs["storage_state"] = state
-        self._context = await self._browser.new_context(**kwargs)
+
+        try:
+            self._context = await self._browser.new_context(**kwargs)
+        except Exception as exc:
+            # If a stale runtime state is ever malformed for another reason,
+            # retry once with a clean context rather than making MCP unusable.
+            if "storage_state" not in kwargs:
+                raise
+            try:
+                RUNTIME_STATE.unlink(missing_ok=True)
+            except Exception:
+                pass
+            kwargs.pop("storage_state", None)
+            self._context = await self._browser.new_context(**kwargs)
+
         await self._context.route("**/*", self._route)
         self._page = await self._context.new_page()
         self._page.set_default_timeout(15_000)
@@ -101,12 +163,13 @@ class MessengerBrowser:
         if not self._context:
             return
         try:
-            try:
-                state = await self._context.storage_state(indexed_db=True)
-            except TypeError:
-                state = await self._context.storage_state()
+            # IMPORTANT: do not use storage_state(indexed_db=True).
+            state = await self._context.storage_state()
+            clean = _sanitize_storage_state(state)
+            if clean is None:
+                return
             RUNTIME_STATE.parent.mkdir(parents=True, exist_ok=True)
-            RUNTIME_STATE.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+            RUNTIME_STATE.write_text(json.dumps(clean, ensure_ascii=False), encoding="utf-8")
         except Exception:
             pass
 
@@ -189,7 +252,7 @@ class MessengerBrowser:
         if not await self._is_logged_in(page):
             raise RuntimeError(
                 "Messenger chưa đăng nhập hoặc session đã hết hạn. "
-                "Hãy chạy login_export.py trên máy bạn và cập nhật MESSENGER_STORAGE_STATE_B64 trên Render."
+                "Hãy nhập lại cookie tại trang /cookie/<key>."
             )
 
     async def status(self) -> dict[str, Any]:
@@ -201,6 +264,7 @@ class MessengerBrowser:
                 "url": page.url,
                 "browser_idle_close_seconds": IDLE_SECONDS,
                 "heavy_resources_blocked": BLOCK_HEAVY,
+                "storage_state": "cookies + localStorage only; IndexedDB disabled",
                 "note": "OK" if logged_in else "Session chưa hợp lệ hoặc đã hết hạn.",
             }
 
@@ -209,14 +273,14 @@ class MessengerBrowser:
         async with self._lock:
             page = await self._goto_unlocked(MESSENGER_URL)
             await self._require_login(page)
-            for _ in range(3):
-                if await page.locator('a[href*="/t/"]').count() >= min(limit, 10):
+            for _ in range(6):
+                if await page.locator('a[href*="/t/"]').count() >= min(limit, 25):
                     break
-                await page.mouse.wheel(0, 700)
+                await page.mouse.wheel(0, 900)
                 await page.wait_for_timeout(500)
 
             anchors = page.locator('a[href*="/t/"]')
-            count = min(await anchors.count(), 250)
+            count = min(await anchors.count(), 300)
             out: list[dict[str, str]] = []
             seen: set[str] = set()
             for i in range(count):
@@ -290,9 +354,8 @@ class MessengerBrowser:
                         continue
                     text = re.sub(r"[ \t]+", " ", text)
                     text = re.sub(r"\n{3,}", "\n\n", text).strip()
-                    if not text or len(text) > 4000:
-                        continue
-                    raw.append(text)
+                    if text and len(text) <= 4000:
+                        raw.append(text)
                 if raw:
                     break
             cleaned: list[str] = []
