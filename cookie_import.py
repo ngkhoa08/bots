@@ -4,7 +4,7 @@ import hmac
 import json
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
@@ -17,12 +17,12 @@ COOKIE_HTML = r'''<!doctype html>
 body{font-family:system-ui,-apple-system,sans-serif;background:#111;color:#eee;margin:0;padding:20px}main{max-width:850px;margin:auto}.card{background:#1c1c1c;border:1px solid #333;border-radius:14px;padding:16px;margin-bottom:14px}textarea{width:100%;box-sizing:border-box;min-height:270px;background:#0c0c0c;color:#eee;border:1px solid #555;border-radius:10px;padding:12px;font-family:ui-monospace,monospace;font-size:13px;resize:vertical}button{padding:11px 15px;border:0;border-radius:9px;font-weight:700;cursor:pointer;margin-right:8px}#go{background:#fff;color:#111}#msg{white-space:pre-wrap;margin-top:12px}.warn{color:#ffc267}.ok{color:#76df99}small{color:#aaa;line-height:1.5}code{background:#292929;padding:2px 5px;border-radius:5px}</style></head>
 <body><main><div class="card"><h2>Đăng nhập Messenger bằng cookie</h2>
 <p class="warn">Cookie là chìa khóa đăng nhập tài khoản. Chỉ dán vào trang Render này; không gửi cookie vào ChatGPT hoặc cho người khác.</p>
-<small>Hỗ trợ: (1) JSON array xuất từ Cookie-Editor/công cụ tương tự; hoặc (2) chuỗi Cookie header dạng <code>c_user=...; xs=...; datr=...</code>. JSON đầy đủ đáng tin cậy hơn vì giữ domain, expiry và SameSite.</small></div>
-<div class="card"><textarea id="cookie" autocomplete="off" spellcheck="false" placeholder='Dán cookie JSON hoặc Cookie header vào đây'></textarea><div style="margin-top:10px"><button id="go">Nạp cookie & kiểm tra Messenger</button><button id="clear">Xóa ô</button></div><div id="msg"></div></div>
+<small>Trang này chỉ nạp cookie vào Chromium rồi mở <code>https://www.messenger.com/</code>. Không mở Facebook trước.</small></div>
+<div class="card"><textarea id="cookie" autocomplete="off" spellcheck="false" placeholder='Dán cookie JSON hoặc Cookie header vào đây'></textarea><div style="margin-top:10px"><button id="go">Nạp cookie & mở Messenger</button><button id="clear">Xóa ô</button></div><div id="msg"></div></div>
 </main><script>
 const base=location.pathname.replace(/\/$/,'');const box=document.getElementById('cookie'),msg=document.getElementById('msg');
 document.getElementById('clear').onclick=()=>{box.value='';msg.textContent=''};
-document.getElementById('go').onclick=async()=>{const value=box.value.trim();if(!value){msg.textContent='Chưa có cookie.';return}msg.textContent='Đang nạp cookie và mở Messenger...';try{const r=await fetch(base+'/apply',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({cookie:value})});const j=await r.json();if(!r.ok)throw new Error(j.detail||j.error||('HTTP '+r.status));box.value='';if(j.logged_in){msg.innerHTML='<span class="ok">✓ Đăng nhập thành công. Session đã được lưu trên Render.</span><br>'+j.url}else{msg.innerHTML='<span class="warn">Cookie đã được nạp nhưng Messenger chưa xác nhận đăng nhập.</span><br>'+j.url+'<br>Cookie có thể thiếu/hết hạn hoặc Facebook yêu cầu checkpoint.'}}catch(e){msg.textContent='Lỗi: '+e.message}};
+document.getElementById('go').onclick=async()=>{const value=box.value.trim();if(!value){msg.textContent='Chưa có cookie.';return}msg.textContent='Đang nạp cookie và mở Messenger...';try{const r=await fetch(base+'/apply',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({cookie:value})});const text=await r.text();let j;try{j=JSON.parse(text)}catch{throw new Error('Render vừa ngắt kết nối hoặc trả về trang HTML. Hãy chờ vài giây rồi thử lại.')}if(!r.ok)throw new Error(j.detail||j.error||('HTTP '+r.status));box.value='';if(j.logged_in){msg.innerHTML='<span class="ok">✓ Đăng nhập Messenger thành công. Session đã được lưu trên Render.</span><br>'+j.url}else{msg.innerHTML='<span class="warn">Cookie đã được nạp nhưng Messenger chưa xác nhận đăng nhập.</span><br>'+j.url+'<br>Cookie có thể thiếu, hết hạn hoặc Messenger yêu cầu xác minh.'}}catch(e){msg.textContent='Lỗi: '+e.message}};
 </script></body></html>'''
 
 
@@ -62,7 +62,7 @@ def _from_json(raw: Any) -> list[dict[str, Any]]:
         if domain:
             c["domain"] = domain
         else:
-            c["url"] = "https://www.facebook.com/"
+            c["url"] = MESSENGER_URL
         exp = item.get("expirationDate", item.get("expires"))
         try:
             if exp is not None and float(exp) > 0:
@@ -96,9 +96,7 @@ def _from_header(text: str) -> list[dict[str, Any]]:
             pairs.append((name, value.strip()))
     if not pairs:
         raise ValueError("Cookie header không hợp lệ")
-    # Facebook auth cookies normally belong to .facebook.com. Messenger can use
-    # the authenticated Facebook session after navigation/redirect.
-    return [{"name": n, "value": v, "domain": ".facebook.com", "path": "/", "secure": True} for n, v in pairs]
+    return [{"name": n, "value": v, "domain": ".messenger.com", "path": "/", "secure": True} for n, v in pairs]
 
 
 def parse_cookie(text: str) -> list[dict[str, Any]]:
@@ -131,7 +129,6 @@ def register_cookie_import(app: FastAPI, access_key: str) -> None:
             raise HTTPException(400, str(exc))
 
         async with messenger._lock:
-            # Start a clean browser context, then inject the user's own cookies.
             await messenger._close_unlocked()
             await messenger._start_unlocked()
             assert messenger._context is not None
@@ -143,13 +140,6 @@ def register_cookie_import(app: FastAPI, access_key: str) -> None:
                 raise HTTPException(400, f"Playwright không chấp nhận cookie: {exc}")
 
             page = messenger._page
-            # Visit Facebook first because most personal-account auth cookies are
-            # scoped to .facebook.com, then load Messenger.
-            try:
-                await page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=35_000)
-                await page.wait_for_timeout(900)
-            except Exception:
-                pass
             await page.goto(MESSENGER_URL, wait_until="domcontentloaded", timeout=35_000)
             await page.wait_for_timeout(1600)
             logged = await messenger._is_logged_in(page)
