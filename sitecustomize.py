@@ -57,28 +57,20 @@ def _selfdiag_call(tool: str, arguments: dict | None = None):
 
 
 def _run_selfdiag() -> None:
-    # Runtime-only. During Render build PORT is absent, so this thread is never started.
     try:
-        time.sleep(10)
-        status = _selfdiag_call("messenger_status")
-        print("[selfdiag] status=" + json.dumps(status, ensure_ascii=False)[:5000])
-
-        unlock = _selfdiag_call("messenger_unlock_history")
-        print("[selfdiag] unlock=" + json.dumps(unlock, ensure_ascii=False)[:5000])
-
+        # Give Uvicorn time to bind localhost. One browser navigation only: repeated
+        # Facebook reloads can push the 512 MB free instance over its memory limit.
+        time.sleep(14)
         inspect = _selfdiag_call("browser_inspect") or {}
         slim = {
             "url": inspect.get("url"),
             "title": inspect.get("title"),
-            "visible_text": (inspect.get("visible_text") or [])[:40],
-            "interactive_elements": (inspect.get("interactive_elements") or [])[:100],
+            "visible_text": (inspect.get("visible_text") or [])[:50],
+            "interactive_elements": (inspect.get("interactive_elements") or [])[:120],
         }
-        print("[selfdiag] inspect=" + json.dumps(slim, ensure_ascii=False)[:30000])
-
-        chats = _selfdiag_call("messenger_list_chats", {"limit": 10})
-        print("[selfdiag] chats=" + json.dumps(chats, ensure_ascii=False)[:30000])
+        print("[selfdiag-onepass] inspect=" + json.dumps(slim, ensure_ascii=False)[:45000])
     except Exception as exc:
-        print(f"[selfdiag] failed: {type(exc).__name__}: {exc}")
+        print(f"[selfdiag-onepass] failed: {type(exc).__name__}: {exc}")
 
 
 if os.getenv("PORT") and os.getenv("MCP_ACCESS_KEY"):
