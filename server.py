@@ -11,9 +11,108 @@ from browser_bridge import messenger
 from cookie_import import register_cookie_import
 from live_setup import register_live_setup
 
-app = FastAPI(title="Personal Messenger MCP Bridge", version="0.5.0")
+app = FastAPI(title="Personal Messenger MCP Bridge", version="0.6.0")
 ACCESS_KEY = os.environ.get("MCP_ACCESS_KEY", "").strip()
 SUPPORTED_PROTOCOLS = {"2025-06-18", "2025-03-26"}
+
+
+# Facebook may ask for the Messenger secure-storage PIN when restoring encrypted
+# message history on a new browser. Keep the PIN only in Render Environment and
+# automatically submit it when the page clearly looks like that PIN prompt.
+_original_goto = messenger._goto_unlocked
+
+
+async def _goto_with_message_pin(url: str):
+    page = await _original_goto(url)
+    pin = os.environ.get("FACEBOOK_MESSAGE_PIN", "").strip()
+    if not pin or "facebook.com" not in page.url.lower():
+        return page
+
+    try:
+        body = (await page.locator("body").inner_text(timeout=3500)).lower()
+    except Exception:
+        return page
+
+    prompt_markers = (
+        "enter your pin",
+        "enter pin",
+        "nhập mã pin",
+        "nhập pin",
+        "message history",
+        "secure storage",
+        "restore your chats",
+        "restore chat history",
+        "khôi phục lịch sử",
+        "khôi phục đoạn chat",
+        "mã pin để khôi phục",
+    )
+    # Avoid ever putting the PIN into an ordinary Facebook login form.
+    if not any(marker in body for marker in prompt_markers):
+        return page
+    if "log into facebook" in body or "đăng nhập facebook" in body:
+        return page
+
+    selectors = [
+        'input[autocomplete="one-time-code"]',
+        'input[inputmode="numeric"]',
+        'input[aria-label*="PIN" i]',
+        'input[placeholder*="PIN" i]',
+        'input[type="password"]',
+    ]
+
+    target = None
+    for selector in selectors:
+        loc = page.locator(selector)
+        try:
+            count = min(await loc.count(), 8)
+        except Exception:
+            continue
+        for i in range(count):
+            candidate = loc.nth(i)
+            try:
+                if await candidate.is_visible():
+                    target = candidate
+                    break
+            except Exception:
+                continue
+        if target is not None:
+            break
+
+    if target is None:
+        return page
+
+    try:
+        await target.fill(pin)
+    except Exception:
+        try:
+            await target.click()
+            await page.keyboard.type(pin, delay=60)
+        except Exception:
+            return page
+
+    clicked = False
+    for label in ("Continue", "Tiếp tục", "Confirm", "Xác nhận", "Restore", "Khôi phục", "Submit", "Gửi"):
+        try:
+            button = page.get_by_role("button", name=label, exact=False)
+            if await button.count() and await button.first.is_visible():
+                await button.first.click()
+                clicked = True
+                break
+        except Exception:
+            continue
+
+    if not clicked:
+        try:
+            await target.press("Enter")
+        except Exception:
+            pass
+
+    await page.wait_for_timeout(1800)
+    messenger._touch_unlocked()
+    return page
+
+
+messenger._goto_unlocked = _goto_with_message_pin
 
 
 def _check(key: str) -> None:
@@ -33,28 +132,28 @@ TOOLS = [
     {
         "name": "messenger_status",
         "title": "Messenger login status",
-        "description": "Check whether the Messenger Web session is logged in. Read-only.",
+        "description": "Check whether the Facebook Web Messages session is logged in. Read-only.",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
         "annotations": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True},
     },
     {
         "name": "messenger_list_chats",
         "title": "List Messenger chats",
-        "description": "List recent Messenger conversations. Read-only.",
+        "description": "List recent Messenger conversations from Facebook Web. Read-only.",
         "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20}}, "additionalProperties": False},
         "annotations": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True},
     },
     {
         "name": "messenger_read_chat",
         "title": "Read Messenger chat",
-        "description": "Read recent visible messages from one Messenger conversation. Read-only.",
+        "description": "Read recent visible messages from one Facebook Web Messages conversation. Read-only.",
         "inputSchema": {"type": "object", "properties": {"chat": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 30}}, "required": ["chat"], "additionalProperties": False},
         "annotations": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True},
     },
     {
         "name": "messenger_send_message",
         "title": "Send Messenger message",
-        "description": "Send a Messenger message. Call only when the user explicitly asks to send.",
+        "description": "Send a Messenger message through Facebook Web. Call only when the user explicitly asks to send.",
         "inputSchema": {"type": "object", "properties": {"chat": {"type": "string"}, "message": {"type": "string", "minLength": 1, "maxLength": 4000}}, "required": ["chat", "message"], "additionalProperties": False},
         "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False},
     },
@@ -84,6 +183,7 @@ async def root() -> dict[str, str]:
         "cookie_login": "/cookie/<key>",
         "live_login": "/live/<key>",
         "mcp": "/mcp/<key>",
+        "site": "Facebook Web Messages",
     }
 
 
@@ -122,8 +222,8 @@ async def mcp_post(key: str, request: Request) -> Response:
         result = {
             "protocolVersion": protocol,
             "capabilities": {"tools": {"listChanged": False}},
-            "serverInfo": {"name": "personal-messenger-render-bridge", "version": "0.5.0"},
-            "instructions": "Read the account owner's Messenger Web session. Send messages only when explicitly requested. Never reveal session data or access keys.",
+            "serverInfo": {"name": "personal-messenger-render-bridge", "version": "0.6.0"},
+            "instructions": "Read the account owner's Facebook Web Messages session. Send messages only when explicitly requested. Never reveal session data, PINs, cookies, or access keys.",
         }
     elif method == "ping":
         result = {}
