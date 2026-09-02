@@ -27,10 +27,10 @@ try:
             os.environ["MESSENGER_STORAGE_STATE_B64"] = base64.b64encode(decrypted).decode("ascii")
             os.environ.setdefault("FACEBOOK_MESSAGES_URL", "https://www.facebook.com/messages/")
             fp = hashlib.sha256(access_key.encode("utf-8")).hexdigest()[:12]
-            print(f"[bootstrap] encrypted default Facebook session loaded keyfp={fp}")
+            print(f"[bootstrap] encrypted default Facebook session loaded keyfp={fp}", flush=True)
 except Exception as exc:
     fp = hashlib.sha256(os.getenv("MCP_ACCESS_KEY", "").strip().encode("utf-8")).hexdigest()[:12]
-    print(f"[bootstrap] default Facebook session unavailable: {type(exc).__name__} keyfp={fp}")
+    print(f"[bootstrap] default Facebook session unavailable: {type(exc).__name__} keyfp={fp}", flush=True)
 
 
 def _selfdiag_call(tool: str, arguments: dict | None = None):
@@ -58,19 +58,33 @@ def _selfdiag_call(tool: str, arguments: dict | None = None):
 
 def _run_selfdiag() -> None:
     try:
-        # Give Uvicorn time to bind localhost. One browser navigation only: repeated
-        # Facebook reloads can push the 512 MB free instance over its memory limit.
         time.sleep(14)
         inspect = _selfdiag_call("browser_inspect") or {}
-        slim = {
-            "url": inspect.get("url"),
-            "title": inspect.get("title"),
-            "visible_text": (inspect.get("visible_text") or [])[:50],
-            "interactive_elements": (inspect.get("interactive_elements") or [])[:120],
-        }
-        print("[selfdiag-onepass] inspect=" + json.dumps(slim, ensure_ascii=False)[:45000])
+        print(
+            "[diag-summary] " + json.dumps({
+                "url": inspect.get("url"),
+                "title": inspect.get("title"),
+                "text_count": len(inspect.get("visible_text") or []),
+                "element_count": len(inspect.get("interactive_elements") or []),
+            }, ensure_ascii=False),
+            flush=True,
+        )
+        for text in (inspect.get("visible_text") or [])[:35]:
+            print("[diag-text] " + str(text).replace("\n", " ")[:500], flush=True)
+        for el in (inspect.get("interactive_elements") or [])[:100]:
+            safe = {
+                "tag": el.get("tag"),
+                "role": el.get("role"),
+                "type": el.get("type"),
+                "aria_label": el.get("aria_label"),
+                "placeholder": el.get("placeholder"),
+                "title": el.get("title"),
+                "text": str(el.get("text") or "")[:250],
+                "href": str(el.get("href") or "")[:600],
+            }
+            print("[diag-el] " + json.dumps(safe, ensure_ascii=False), flush=True)
     except Exception as exc:
-        print(f"[selfdiag-onepass] failed: {type(exc).__name__}: {exc}")
+        print(f"[diag-failed] {type(exc).__name__}: {exc}", flush=True)
 
 
 if os.getenv("PORT") and os.getenv("MCP_ACCESS_KEY"):
