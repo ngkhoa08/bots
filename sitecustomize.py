@@ -39,7 +39,68 @@ if os.getenv("PORT"):
     try:
         import browser_bridge as _bb
 
-        _original_read_chat = _bb.MessengerBrowser.read_chat
+        async def _maybe_submit_message_pin(page):
+            pin = os.getenv("FACEBOOK_MESSAGE_PIN", "").strip()
+            if not pin:
+                return False
+            try:
+                state = await page.evaluate(
+                    """() => {
+                      const t = ((document.body && document.body.innerText) || '').toLowerCase();
+                      return {
+                        pinPrompt: ['enter your pin','enter pin','nhập mã pin','nhập pin','restore chat history','restore your chats','khôi phục lịch sử','mã pin để khôi phục'].some(x => t.includes(x)),
+                        login: t.includes('log into facebook') || t.includes('đăng nhập facebook')
+                      };
+                    }"""
+                )
+            except Exception:
+                return False
+            if not state.get("pinPrompt") or state.get("login"):
+                return False
+
+            target = None
+            for selector in (
+                'input[autocomplete="one-time-code"]',
+                'input[inputmode="numeric"]',
+                'input[aria-label*="PIN" i]',
+                'input[placeholder*="PIN" i]',
+                'input[type="password"]',
+            ):
+                try:
+                    loc = page.locator(selector)
+                    count = min(await loc.count(), 6)
+                    for i in range(count):
+                        candidate = loc.nth(i)
+                        if await candidate.is_visible():
+                            target = candidate
+                            break
+                except Exception:
+                    continue
+                if target is not None:
+                    break
+            if target is None:
+                return False
+            try:
+                await target.fill(pin)
+            except Exception:
+                return False
+            for label in ("Continue", "Tiếp tục", "Confirm", "Xác nhận", "Restore", "Khôi phục", "Done", "Xong"):
+                try:
+                    b = page.get_by_role("button", name=label, exact=False)
+                    if await b.count() and await b.first.is_visible():
+                        await b.first.click()
+                        await page.wait_for_timeout(1400)
+                        print("[pin] secure-storage PIN submitted", flush=True)
+                        return True
+                except Exception:
+                    continue
+            try:
+                await target.press("Enter")
+                await page.wait_for_timeout(1400)
+                print("[pin] secure-storage PIN submitted with Enter", flush=True)
+                return True
+            except Exception:
+                return False
 
         async def _waited_list_chats(self, limit: int = 20):
             limit = max(1, min(int(limit), 100))
@@ -92,91 +153,78 @@ if os.getenv("PORT"):
                 self._touch_unlocked()
                 return list(found.values())[:limit]
 
-        async def _probe_conversation_ui(page):
-            composer = page.locator('[role="textbox"][contenteditable="true"], div[contenteditable="true"]')
-            composer_count = 0
-            message_count = 0
-            for _ in range(26):
-                try:
-                    composer_count = await composer.count()
-                    message_count = max(
-                        await page.locator('[role="main"] [role="row"]').count(),
-                        await page.locator('[role="main"] div[dir="auto"]').count(),
-                    )
-                except Exception:
-                    composer_count = 0
-                    message_count = 0
-                if composer_count > 0 or message_count > 3:
-                    break
-                await page.wait_for_timeout(1000)
-            return composer_count, message_count
-
-        async def _extract_messages_after_wait(page, limit: int):
-            selectors = [
-                '[role="main"] [role="row"]',
-                '[role="main"] [data-scope="messages_table"] [role="row"]',
-                '[role="main"] div[dir="auto"]',
-            ]
-            raw: list[str] = []
-            for sel in selectors:
-                loc = page.locator(sel)
-                try:
-                    count = await loc.count()
-                except Exception:
-                    continue
-                if count == 0:
-                    continue
-                start = max(0, count - max(limit * 5, 80))
-                for i in range(start, count):
-                    try:
-                        text = (await loc.nth(i).inner_text()).strip()
-                    except Exception:
-                        continue
-                    text = re.sub(r"[ \t]+", " ", text)
-                    text = re.sub(r"\n{3,}", "\n\n", text).strip()
-                    if text and len(text) <= 4000:
-                        raw.append(text)
-                if raw:
-                    break
-            cleaned: list[str] = []
-            skip = {"Messenger", "Chats", "Search Messenger", "New message", "Đoạn chat", "Tìm kiếm trên Messenger"}
-            for text in raw:
-                if cleaned and text == cleaned[-1]:
-                    continue
-                if text in skip:
-                    continue
-                cleaned.append(text)
-            return cleaned[-limit:]
-
-        async def _read_chat_waited(self, chat: str, limit: int = 30):
-            limit = max(1, min(int(limit), 100))
-            result = await _original_read_chat(self, chat, limit)
-            composer_count = 0
-            ui_message_count = 0
+        async def _conversation_snapshot(page, limit: int):
             try:
-                async with self._lock:
-                    page = self._page
-                    if page is not None:
-                        composer_count, ui_message_count = await _probe_conversation_ui(page)
-                        messages = await _extract_messages_after_wait(page, limit)
-                        if isinstance(result, dict) and messages:
-                            result["messages"] = messages
-                        if isinstance(result, dict) and composer_count == 0:
-                            try:
-                                body = (await page.locator("body").inner_text()).splitlines()
-                                result["ui_probe"] = [re.sub(r"\s+", " ", x).strip()[:400] for x in body if x.strip()][:25]
-                            except Exception:
-                                pass
+                return await page.evaluate(
+                    """(limit) => {
+                      const clean = s => (s || '').replace(/[ \\t]+/g, ' ').replace(/\\n{3,}/g, '\\n\\n').trim();
+                      const visible = el => {
+                        const r = el.getBoundingClientRect();
+                        const st = getComputedStyle(el);
+                        return r.width > 1 && r.height > 1 && st.display !== 'none' && st.visibility !== 'hidden';
+                      };
+                      const main = document.querySelector('[role="main"]') || document.body;
+                      const composers = Array.from(document.querySelectorAll('[role="textbox"][contenteditable="true"], div[contenteditable="true"]')).filter(visible);
+                      const candidates = Array.from(main.querySelectorAll('[role="row"], [data-scope="messages_table"] [role="row"], div[dir="auto"]')).filter(visible);
+                      const texts = [];
+                      const seen = new Set();
+                      for (const el of candidates) {
+                        const t = clean(el.innerText || el.textContent);
+                        if (!t || t.length > 4000 || seen.has(t)) continue;
+                        seen.add(t);
+                        texts.push(t);
+                      }
+                      const body = clean((document.body && document.body.innerText) || '');
+                      return {
+                        composerCount: composers.length,
+                        nodeCount: candidates.length,
+                        messages: texts.slice(-Math.max(limit * 4, 40)).slice(-limit),
+                        mainText: clean(main.innerText || '').slice(0, 2500),
+                        bodyLower: body.toLowerCase().slice(0, 6000)
+                      };
+                    }""",
+                    limit,
+                )
             except Exception:
-                pass
-            if isinstance(result, dict):
-                result["composer_present"] = composer_count > 0
-                result["composer_count"] = composer_count
-                result["ui_message_nodes"] = ui_message_count
-                result["send_dry_run"] = "ready" if composer_count > 0 else "composer_not_found"
-            return result
+                return {"composerCount": 0, "nodeCount": 0, "messages": [], "mainText": "", "bodyLower": ""}
 
-        async def _send_message_waited(self, chat: str, message: str):
+        async def _wait_conversation_ready(page, limit: int):
+            last = {}
+            pin_attempted = False
+            for attempt in range(27):
+                last = await _conversation_snapshot(page, limit)
+                if last.get("composerCount", 0) > 0 or last.get("nodeCount", 0) > 5:
+                    return last
+                if not pin_attempted and attempt >= 2:
+                    pin_attempted = await _maybe_submit_message_pin(page)
+                await page.wait_for_timeout(900)
+            return last
+
+        async def _read_chat_light(self, chat: str, limit: int = 30):
+            limit = max(1, min(int(limit), 100))
+            url, resolved_name = await self._resolve_chat(chat)
+            async with self._lock:
+                page = await self._goto_unlocked(url)
+                await self._require_login(page)
+                snap = await _wait_conversation_ready(page, limit)
+                messages = [str(x).strip() for x in (snap.get("messages") or []) if str(x).strip()]
+                skip = {"Messenger", "Chats", "Search Messenger", "New message", "Đoạn chat", "Tìm kiếm trên Messenger"}
+                cleaned = [x for x in messages if x not in skip]
+                self._touch_unlocked()
+                return {
+                    "chat": resolved_name,
+                    "url": page.url,
+                    "messages": cleaned[-limit:],
+                    "site": "Facebook Web Messages",
+                    "composer_present": int(snap.get("composerCount", 0)) > 0,
+                    "composer_count": int(snap.get("composerCount", 0)),
+                    "ui_message_nodes": int(snap.get("nodeCount", 0)),
+                    "send_dry_run": "ready" if int(snap.get("composerCount", 0)) > 0 else "composer_not_found",
+                    "ui_probe": [] if cleaned else [x.strip()[:500] for x in str(snap.get("mainText") or "").splitlines() if x.strip()][:20],
+                    "warning": "Facebook Web DOM is unofficial and may change.",
+                }
+
+        async def _send_message_light(self, chat: str, message: str):
             message = message.strip()
             if not message:
                 raise ValueError("message không được để trống")
@@ -186,31 +234,29 @@ if os.getenv("PORT"):
             async with self._lock:
                 page = await self._goto_unlocked(url)
                 await self._require_login(page)
-                composer_count, _ = await _probe_conversation_ui(page)
-                if composer_count <= 0:
+                snap = await _wait_conversation_ready(page, 5)
+                if int(snap.get("composerCount", 0)) <= 0:
                     raise RuntimeError("Không tìm thấy ô soạn tin sau khi đã chờ Facebook tải hội thoại.")
                 composer = page.locator('[role="textbox"][contenteditable="true"]')
-                count = await composer.count()
-                if count == 0:
+                if await composer.count() == 0:
                     composer = page.locator('div[contenteditable="true"]')
-                    count = await composer.count()
-                if count == 0:
+                if await composer.count() == 0:
                     raise RuntimeError("Không tìm thấy ô soạn tin trên Facebook Web.")
                 box = composer.last
                 await box.click()
                 try:
                     await box.fill(message)
                 except Exception:
-                    await page.keyboard.type(message)
+                    await page.keyboard.type(message, delay=10)
                 await box.press("Enter")
                 await page.wait_for_timeout(900)
                 self._touch_unlocked()
                 return {"sent": True, "chat": resolved_name, "text": message, "url": page.url, "site": "Facebook Web Messages"}
 
         _bb.MessengerBrowser.list_chats = _waited_list_chats
-        _bb.MessengerBrowser.read_chat = _read_chat_waited
-        _bb.MessengerBrowser.send_message = _send_message_waited
-        print("[runtime-patch] waited list/read/send extractors installed", flush=True)
+        _bb.MessengerBrowser.read_chat = _read_chat_light
+        _bb.MessengerBrowser.send_message = _send_message_light
+        print("[runtime-patch] lightweight list/read/send extractors installed", flush=True)
     except Exception as exc:
         print(f"[runtime-patch] failed: {type(exc).__name__}: {exc}", flush=True)
 
